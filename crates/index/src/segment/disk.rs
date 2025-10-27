@@ -14,7 +14,7 @@ use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, BufWriter},
 };
 
-use super::memory::{Entry, MemorySegment};
+use super::memory::{Entry, CachedSegment};
 
 pub struct DiskSegment {
     directory: PathBuf,
@@ -125,7 +125,7 @@ impl DiskSegment {
         Ok(())
     }
 
-    pub async fn flush_memory_segment(&self, segment: &MemorySegment) -> Result<(), io::Error> {
+    pub async fn flush_memory_segment(&self, segment: &CachedSegment) -> Result<(), io::Error> {
         self.write_full_table("keys", segment.keys.iter()).await?;
         self.write_full_table("values", segment.values.iter())
             .await?;
@@ -138,13 +138,13 @@ impl DiskSegment {
     }
 
     #[inline]
-    pub async fn create_empty_segment(directory: PathBuf) -> Result<Self, io::Error> {
+    pub async fn open_or_create_segment(directory: PathBuf) -> Result<Self, io::Error> {
         Ok(Self { directory })
     }
 }
 
 #[derive(Debug, Snafu)]
-pub enum ResolutionError {
+pub enum DiskResolutionError {
     #[snafu(display("segment lookup table is of invalid size"))]
     LookupInvalidSize,
 
@@ -177,13 +177,13 @@ struct LinearMappedResolver {
     pub lookup: File,
     pub length: u64,
 }
-async fn read_offset(lookup: &mut File, offset: u64) -> Result<u64, ResolutionError> {
+async fn read_offset(lookup: &mut File, offset: u64) -> Result<u64, DiskResolutionError> {
     lookup.seek(SeekFrom::Start(offset)).await?;
 
     Ok(lookup.read_u64().await?)
 }
 
-async fn read_entry_within(data: &mut File, offset: u64) -> Result<String, ResolutionError> {
+async fn read_entry_within(data: &mut File, offset: u64) -> Result<String, DiskResolutionError> {
     data.seek(SeekFrom::Start(offset)).await?;
 
     let length_and_flag = data.read_u32().await? as usize;
@@ -203,9 +203,9 @@ async fn read_entry_within(data: &mut File, offset: u64) -> Result<String, Resol
 }
 
 impl LinearMappedResolver {
-    pub async fn map_to_index(&mut self, key: &str) -> Result<Option<u32>, ResolutionError> {
+    pub async fn map_to_index(&mut self, key: &str) -> Result<Option<u32>, DiskResolutionError> {
         if self.length % size_of::<u64>() as u64 != 0 {
-            return Err(ResolutionError::LookupInvalidSize);
+            return Err(DiskResolutionError::LookupInvalidSize);
         }
 
         let size = length(self.length, size_of::<u64>());
@@ -236,9 +236,9 @@ impl LinearMappedResolver {
         Ok(None)
     }
 
-    pub async fn get_value_under(&mut self, index: u32) -> Result<String, ResolutionError> {
+    pub async fn get_value_under(&mut self, index: u32) -> Result<String, DiskResolutionError> {
         if self.length % size_of::<u64>() as u64 != 0 {
-            return Err(ResolutionError::LookupInvalidSize);
+            return Err(DiskResolutionError::LookupInvalidSize);
         }
 
         let offset = read_offset(&mut self.lookup, convert(index, size_of::<u64>())).await?;
@@ -256,7 +256,7 @@ struct EntriesAndLinearMappedValueResolver {
 }
 
 impl EntriesAndLinearMappedValueResolver {
-    async fn read_sequential(&mut self, key: u32) -> Result<Vec<String>, ResolutionError> {
+    async fn read_sequential(&mut self, key: u32) -> Result<Vec<String>, DiskResolutionError> {
         let mut items = Vec::new();
 
         loop {
@@ -286,9 +286,9 @@ impl EntriesAndLinearMappedValueResolver {
     pub async fn resolve_entries_with_key(
         mut self,
         key: u32,
-    ) -> Result<Vec<String>, ResolutionError> {
+    ) -> Result<Vec<String>, DiskResolutionError> {
         if self.length % (size_of::<u32>() * 2) as u64 != 0 {
-            return Err(ResolutionError::LookupInvalidSize);
+            return Err(DiskResolutionError::LookupInvalidSize);
         }
 
         let size = length(self.length, size_of::<u32>() * 2);
@@ -344,13 +344,13 @@ impl EntriesAndLinearMappedValueResolver {
 }
 
 impl DiskSegment {
-    pub async fn find(&self, key: &str) -> Result<Vec<String>, ResolutionError> {
+    pub async fn find(&self, key: &str) -> Result<Vec<String>, DiskResolutionError> {
         let contains = {
             let mut bloom = File::open(self.directory.join("bloom.bin")).await?;
             let mut buffer = Vec::with_capacity(4096);
             bloom.read_to_end(&mut buffer).await?;
             let bloom =
-                Bloom::<str>::from_bytes(buffer).map_err(|_| ResolutionError::BloomLoadError)?;
+                Bloom::<str>::from_bytes(buffer).map_err(|_| DiskResolutionError::BloomLoadError)?;
 
             bloom.check(key)
         };
@@ -400,10 +400,12 @@ impl DiskSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::memory::MemorySegment;
+    use crate::segment::memory::CachedSegment;
     use std::collections::HashSet;
+    use fxhash::FxHashMap;
     use tempfile::tempdir;
     use tokio::fs;
+
 
     #[tokio::test]
     async fn flush_and_find_single_key_multiple_values() {
@@ -412,14 +414,16 @@ mod tests {
 
         fs::create_dir_all(&dir).await.unwrap();
 
-        let mem_seg = MemorySegment::new([("key", ["value", "value", "value2"])]);
-        let disk_seg = DiskSegment::create_empty_segment(dir.clone())
+        let mut map = FxHashMap::default();
+        map.insert("key", vec!["value", "value2"]);
+
+        let mem_seg = CachedSegment::new(map);
+        let disk_seg = DiskSegment::open_or_create_segment(dir.clone())
             .await
             .unwrap();
         disk_seg.flush_memory_segment(&mem_seg).await.unwrap();
 
         let resolved = disk_seg.find("key").await.unwrap();
-
         let set: HashSet<_> = resolved.iter().cloned().collect();
         assert_eq!(
             set,
@@ -434,8 +438,12 @@ mod tests {
 
         fs::create_dir_all(&dir).await.unwrap();
 
-        let mem_seg = MemorySegment::new([("a", ["1"]), ("b", ["2"])]);
-        let disk_seg = DiskSegment::create_empty_segment(dir.clone())
+        let mut map = FxHashMap::default();
+        map.insert("a", vec!["1"]);
+        map.insert("b", vec!["2"]);
+
+        let mem_seg = CachedSegment::new(map);
+        let disk_seg = DiskSegment::open_or_create_segment(dir.clone())
             .await
             .unwrap();
         disk_seg.flush_memory_segment(&mem_seg).await.unwrap();
@@ -451,8 +459,12 @@ mod tests {
 
         fs::create_dir_all(&dir).await.unwrap();
 
-        let mem_seg = MemorySegment::new([("a", ["1"]), ("a", ["2"])]);
-        let disk_seg = DiskSegment::create_empty_segment(dir.clone())
+        // Merge duplicate keys before insertion
+        let mut map = FxHashMap::default();
+        map.insert("a", vec!["1", "2"]);
+
+        let mem_seg = CachedSegment::new(map);
+        let disk_seg = DiskSegment::open_or_create_segment(dir.clone())
             .await
             .unwrap();
         disk_seg.flush_memory_segment(&mem_seg).await.unwrap();
@@ -468,8 +480,12 @@ mod tests {
 
         fs::create_dir_all(&dir).await.unwrap();
 
-        let mem_seg = MemorySegment::new([("a", ["1"]), ("b", ["1"])]);
-        let disk_seg = DiskSegment::create_empty_segment(dir.clone())
+        let mut map = FxHashMap::default();
+        map.insert("a", vec!["1"]);
+        map.insert("b", vec!["1"]);
+
+        let mem_seg = CachedSegment::new(map);
+        let disk_seg = DiskSegment::open_or_create_segment(dir.clone())
             .await
             .unwrap();
         disk_seg.flush_memory_segment(&mem_seg).await.unwrap();
@@ -485,8 +501,12 @@ mod tests {
 
         fs::create_dir_all(&dir).await.unwrap();
 
-        let mem_seg = MemorySegment::new([("a", ["1"]), ("a", ["1"])]);
-        let disk_seg = DiskSegment::create_empty_segment(dir.clone())
+        // Duplicate keys and values collapse into one entry
+        let mut map = FxHashMap::default();
+        map.insert("a", vec!["1"]);
+
+        let mem_seg = CachedSegment::new(map);
+        let disk_seg = DiskSegment::open_or_create_segment(dir.clone())
             .await
             .unwrap();
         disk_seg.flush_memory_segment(&mem_seg).await.unwrap();
@@ -501,8 +521,12 @@ mod tests {
 
         fs::create_dir_all(&dir).await.unwrap();
 
-        let mem_seg = MemorySegment::new([("x", ["1"]), ("y", ["2"])]);
-        let disk_seg = DiskSegment::create_empty_segment(dir.clone())
+        let mut map = FxHashMap::default();
+        map.insert("x", vec!["1"]);
+        map.insert("y", vec!["2"]);
+
+        let mem_seg = CachedSegment::new(map);
+        let disk_seg = DiskSegment::open_or_create_segment(dir.clone())
             .await
             .unwrap();
 

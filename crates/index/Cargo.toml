@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 adler2 = "2.0.1"
+base32 = "0.5.1"
 bitflags = "2.10.0"
 bloomfilter = "3.0.1"
 futures-lite = "2.6.1"

@@ -3,7 +3,7 @@ use futures_lite::stream::StopAfterFuture;
 use fxhash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
-use std::{borrow::Cow, path::PathBuf, sync::WaitTimeoutResult};
+use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, sync::WaitTimeoutResult};
 use zerocopy::{ByteHash, IntoBytes};
 
 pub struct SegmentView {
@@ -48,46 +48,41 @@ impl Entry {
     }
 }
 
-pub struct MemorySegment {
+pub struct CachedSegment {
     pub keys: Vec<Entry>,
     pub values: Vec<Entry>,
     pub entries: Vec<(u32, u32)>,
     pub bloom: Bloom<str>,
 }
 
-impl MemorySegment {
-    fn to_keys_values_sets<'key, 'value, I2: IntoIterator<Item = &'value str>>(
-        entries: impl IntoIterator<Item = (&'key str, I2)>,
+impl CachedSegment {
+    fn to_keys_values_sets<K: AsRef<str> + Ord + Eq, B: AsRef<str>>(
+        entries: &FxHashMap<K, Vec<B>>,
     ) -> (Vec<Entry>, Vec<Entry>) {
-        let mut keys = FxHashSet::default();
-        let mut values = FxHashSet::default();
+        let mut values_mapping = FxHashSet::default();
+
+        let mut linear_keys = Vec::new();
 
         for (key, items) in entries {
-            keys.insert(Entry::new(key));
-            for value in items {
-                values.insert(Entry::new(value));
-            }
+            linear_keys.push(Entry::new(key.as_ref()));
+
+            values_mapping.extend(items.iter().map(|item| item.as_ref()));
         }
 
-        let mut keys = keys.into_iter().collect::<Vec<_>>();
+        let mut keys = linear_keys.into_iter().collect::<Vec<_>>();
         keys.sort_unstable_by(|a, b| a.as_uncompressed().cmp(&b.as_uncompressed()));
 
-        let mut values = values.into_iter().collect::<Vec<_>>();
+        let mut values = values_mapping
+            .into_iter()
+            .map(|item| Entry::new(item))
+            .collect::<Vec<_>>();
         values.sort_unstable_by(|a, b| a.as_uncompressed().cmp(&b.as_uncompressed()));
 
         (keys, values)
     }
 
-    pub fn new<'key, 'value, I2: IntoIterator<Item = &'value str>>(
-        entries: impl IntoIterator<Item = (&'key str, I2)>,
-    ) -> Self {
-        let entries = Vec::from_iter(
-            entries
-                .into_iter()
-                .map(|(key, values)| (key, values.into_iter().collect::<Vec<_>>())),
-        );
-
-        let (keys_linear, values_linear) = Self::to_keys_values_sets(entries.iter().cloned());
+    pub fn new<K: AsRef<str> + Ord + Eq, B: AsRef<str>>(entries: FxHashMap<K, Vec<B>>) -> Self {
+        let (keys_linear, values_linear) = Self::to_keys_values_sets(&entries);
 
         let mut bloom =
             Bloom::new((entries.len().ilog2() * 2 + 1) as usize, entries.len()).unwrap();
@@ -98,13 +93,17 @@ impl MemorySegment {
                 values
                     .into_iter()
                     .map(|value| {
-                        bloom.set(key);
+                        bloom.set(key.as_ref());
 
                         let key = keys_linear
-                            .binary_search_by(|entry| entry.as_uncompressed().as_ref().cmp(key))
+                            .binary_search_by(|entry| {
+                                entry.as_uncompressed().as_ref().cmp(key.as_ref())
+                            })
                             .unwrap();
                         let value = values_linear
-                            .binary_search_by(|entry| entry.as_uncompressed().as_ref().cmp(value))
+                            .binary_search_by(|entry| {
+                                entry.as_uncompressed().as_ref().cmp(value.as_ref())
+                            })
                             .unwrap();
 
                         (key as u32, value as u32)
@@ -193,11 +192,14 @@ mod tests {
 
     #[test]
     fn new_and_resolve_single_key_multiple_values() {
-        // ("key", ["value", "value", "value2"])
-        let seg = MemorySegment::new([("key", ["value", "value", "value2"])]);
+        let mut map = FxHashMap::default();
+        map.insert("key", vec!["value", "value", "value2"]);
+
+        let seg = CachedSegment::new(map);
 
         // Should contain unique key
         assert_eq!(seg.keys.len(), 1);
+
         // Should contain deduplicated values ("value", "value2")
         let unique_values: HashSet<_> = seg
             .values
@@ -213,7 +215,11 @@ mod tests {
 
     #[test]
     fn no_dup_keys_no_dup_values() {
-        let seg = MemorySegment::new([("a", ["1"]), ("b", ["2"])]);
+        let mut map = FxHashMap::default();
+        map.insert("a", vec!["1"]);
+        map.insert("b", vec!["2"]);
+
+        let seg = CachedSegment::new(map);
 
         assert_eq!(seg.keys.len(), 2);
         assert_eq!(seg.values.len(), 2);
@@ -225,7 +231,11 @@ mod tests {
 
     #[test]
     fn dup_keys_no_dup_values() {
-        let seg = MemorySegment::new([("a", ["1"]), ("a", ["2"])]);
+        // Simulate duplicate keys by merging values before calling new()
+        let mut map = FxHashMap::default();
+        map.insert("a", vec!["1", "2"]);
+
+        let seg = CachedSegment::new(map);
 
         // Deduplicated keys (1 unique key)
         assert_eq!(seg.keys.len(), 1);
@@ -233,14 +243,18 @@ mod tests {
         assert_eq!(seg.values.len(), 2);
         assert_eq!(seg.entries.len(), 2);
 
-        // Resolve returns one of the matching values (depending on insertion order)
+        // Resolve returns both values
         let resolved = seg.find("a");
         assert_eq!(resolved, ["1", "2"]);
     }
 
     #[test]
     fn no_dup_keys_dup_values() {
-        let seg = MemorySegment::new([("a", ["1"]), ("b", ["1"])]);
+        let mut map = FxHashMap::default();
+        map.insert("a", vec!["1"]);
+        map.insert("b", vec!["1"]);
+
+        let seg = CachedSegment::new(map);
 
         // 2 keys, 1 deduplicated value
         assert_eq!(seg.keys.len(), 2);
@@ -253,7 +267,11 @@ mod tests {
 
     #[test]
     fn dup_keys_dup_values() {
-        let seg = MemorySegment::new([("a", ["1"]), ("a", ["1"])]);
+        // Duplicates now merge under same key
+        let mut map = FxHashMap::default();
+        map.insert("a", vec!["1", "1"]);
+
+        let seg = CachedSegment::new(map);
 
         // 1 unique key, 1 unique value
         assert_eq!(seg.keys.len(), 1);
