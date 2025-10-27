@@ -1,7 +1,7 @@
 use fxhash::FxHashMap;
 use snafu::Snafu;
-use std::path::PathBuf;
-use tokio::io;
+use std::{path::PathBuf, sync::Arc};
+use tokio::{fs, io, sync::Mutex};
 use tracing::Instrument;
 
 use crate::segment::{self, TieredSegmentMap};
@@ -17,23 +17,58 @@ pub enum PartitionError {
     },
 
     #[snafu(transparent)]
-    CreationError { source: segment::SegmentMapError },
+    SegmentCreationError { source: segment::SegmentMapError },
 }
 
 pub struct PartitionMap {
     directory: PathBuf,
+
+    cache: Mutex<FxHashMap<String, Arc<Mutex<TieredSegmentMap>>>>,
 }
 
 impl PartitionMap {
     pub async fn new(directory: PathBuf) -> Result<Self, PartitionError> {
-        Ok(Self { directory })
+        fs::create_dir_all(&directory).await?;
+
+        tracing::debug!("partition map directory: {directory:?}");
+
+        Ok(Self {
+            directory,
+            cache: Mutex::new(FxHashMap::default()),
+        })
     }
 
     // TODO: implement cache
-    async fn load_segment_map(&self, partition: &str) -> Result<TieredSegmentMap, PartitionError> {
+    async fn load_segment_map_from_disk(
+        &self,
+        partition: &str,
+    ) -> Result<TieredSegmentMap, PartitionError> {
         let key = base32::encode(base32::Alphabet::Z, partition.as_bytes());
 
-        Ok(TieredSegmentMap::new(self.directory.join(key)).await?)
+        let directory = self.directory.join(key);
+
+        tracing::debug!("partition directory: {directory:?}");
+
+        Ok(TieredSegmentMap::new(directory).await?)
+    }
+
+    async fn load_segment_map(
+        &self,
+        partition: &str,
+    ) -> Result<Arc<Mutex<TieredSegmentMap>>, PartitionError> {
+        let mut guard = self.cache.lock().await;
+        if let Some(entry) = guard.get(partition) {
+            Ok(entry.clone())
+        } else {
+            guard.insert(
+                partition.to_string(),
+                Arc::new(Mutex::new(
+                    self.load_segment_map_from_disk(partition).await?,
+                )),
+            );
+
+            Ok(guard.get(partition).unwrap().clone())
+        }
     }
 
     pub async fn index<P: AsRef<str>, K: AsRef<str> + Ord, B: AsRef<str>>(
@@ -41,9 +76,11 @@ impl PartitionMap {
         map: FxHashMap<P, FxHashMap<K, Vec<B>>>,
     ) -> Result<(), PartitionError> {
         for (partition, entries) in map {
-            let mut segment = self.load_segment_map(partition.as_ref()).await?;
+            let segment = self.load_segment_map(partition.as_ref()).await?;
 
             segment
+                .lock()
+                .await
                 .insert(entries)
                 .instrument(tracing::trace_span!(
                     "tiered::index",
@@ -68,6 +105,8 @@ impl PartitionMap {
             for key in keys {
                 result.extend(
                     segments
+                        .lock()
+                        .await
                         .find(key.as_ref(), limit)
                         .instrument(tracing::trace_span!(
                             "tiered::find",

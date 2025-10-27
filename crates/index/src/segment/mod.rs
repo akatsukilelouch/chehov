@@ -1,6 +1,6 @@
-use std::{collections::VecDeque, path::PathBuf};
 use fxhash::FxHashMap;
 use snafu::Snafu;
+use std::{collections::VecDeque, path::PathBuf};
 use tokio::{
     fs::{self, read_dir},
     io,
@@ -36,15 +36,30 @@ pub enum SegmentMapError {
 
 impl TieredSegmentMap {
     pub async fn new(directory: PathBuf) -> Result<Self, SegmentMapError> {
+        if !fs::try_exists(&directory).await? {
+            tracing::debug!("opening {directory:?} as empty segment map");
+
+            return Ok(Self {
+                directory,
+                counter: 0,
+                disk: VecDeque::new(),
+                memory: VecDeque::new(),
+            });
+        }
+
         let mut iter = read_dir(&directory).await?;
         let mut maximum_index = 0usize;
         let mut disk_segments = VecDeque::new();
+
+        tracing::trace!("opening {directory:?} as segment map");
 
         while let Some(entry) = iter.next_entry().await? {
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 return Err(SegmentMapError::UnknownFile);
             };
+
+            tracing::trace!("entry {name:?} in the segment map found");
 
             if !name.starts_with("seg-") {
                 return Err(SegmentMapError::UnknownFile);
@@ -61,8 +76,15 @@ impl TieredSegmentMap {
                 maximum_index = path_index + 1;
             }
 
+            tracing::debug!("segment {path_index:?} found");
+
             disk_segments.push_back(disk::DiskSegment::open_or_create_segment(entry.path()).await?);
         }
+
+        tracing::trace!(
+            "created segment map with {:?} segments",
+            disk_segments.len()
+        );
 
         Ok(Self {
             directory,
@@ -81,8 +103,12 @@ impl TieredSegmentMap {
         if memory_segment.values.len() > 4096 {
             let disk_segment = self.write_segment(&memory_segment).await?;
             self.disk.push_back(disk_segment);
+
+            tracing::debug!("wrote disk segment");
         } else {
             self.memory.push_back(memory_segment);
+
+            tracing::debug!("wrote memory segment");
         }
 
         Ok(())
@@ -98,10 +124,14 @@ impl TieredSegmentMap {
             self.directory.join(format!("{}-segment", self.counter))
         };
 
+        tracing::debug!("issued segment write into: {path:?}");
+
         fs::create_dir_all(&path).await?;
 
         let disk_segment = disk::DiskSegment::open_or_create_segment(path).await?;
         disk_segment.flush_memory_segment(memory_segment).await?;
+
+        tracing::trace!("persisted memory segment to disk: {:?}", disk_segment.directory);
 
         Ok(disk_segment)
     }

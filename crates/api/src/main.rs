@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
 };
 use index::{PartitionMap, fxhash::FxHashMap};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 use std::{path::PathBuf, sync::Arc};
 use tracing_subscriber::EnvFilter;
@@ -50,9 +50,15 @@ async fn index_handle(
         values.push(value);
     }
 
+    tracing::debug!("preprocessed request: {req:?}");
+
     match map.index(req).await {
         Ok(_) => "ok".to_string(),
-        Err(err) => err.to_string(),
+        Err(err) => {
+            tracing::warn!("index error: {err:?}");
+
+            err.to_string()
+        }
     }
 }
 
@@ -62,13 +68,26 @@ struct SearchRequest {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum SearchResponse {
+    Error { error: String },
+    Value { data: Vec<String> },
+}
+
 async fn search_handle(
     State(map): State<Arc<PartitionMap>>,
     Json(SearchRequest { query, limit }): Json<SearchRequest>,
-) -> String {
+) -> Json<SearchResponse> {
     match map.search(query, limit).await {
-        Ok(_) => "ok".to_string(),
-        Err(err) => err.to_string(),
+        Ok(data) => Json::from(SearchResponse::Value { data }),
+        Err(err) => {
+            tracing::warn!("search error: {err:?}");
+
+            Json::from(SearchResponse::Error {
+                error: err.to_string(),
+            })
+        }
     }
 }
 
