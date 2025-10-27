@@ -13,9 +13,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 snafu = "0.8.9"
 snappy = "0.4.0"
-tokio = { version = "1.48.0", features = ["io-std", "io-util"] }
+tokio = { version = "1.48.0", features = ["io-std", "io-util", "macros", "rt"] }
 zerocopy = { version = "0.8.27", features = ["derive", "simd"] }
 
 [features]
 default = ["fs"]
 fs = ["tokio/fs"]
+
+[dev-dependencies]
+tempfile = "3.23.0"

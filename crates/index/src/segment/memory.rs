@@ -37,6 +37,15 @@ impl Entry {
             Self::Uncompressed(buffer) => buffer.as_str().into(),
         }
     }
+
+    pub fn into_uncompressed(self) -> String {
+        match self {
+            Self::Compressed(buffer) => {
+                String::try_from(snappy::uncompress(buffer.as_bytes()).unwrap()).unwrap()
+            }
+            Self::Uncompressed(buffer) => buffer,
+        }
+    }
 }
 
 pub struct MemorySegment {
@@ -69,7 +78,7 @@ impl MemorySegment {
         (keys, values)
     }
 
-    fn new<'key, 'value, I2: IntoIterator<Item = &'value str>>(
+    pub fn new<'key, 'value, I2: IntoIterator<Item = &'value str>>(
         entries: impl IntoIterator<Item = (&'key str, I2)>,
     ) -> Self {
         let entries = Vec::from_iter(
@@ -116,7 +125,7 @@ impl MemorySegment {
         }
     }
 
-    pub fn resolve(&self, key: &str) -> Vec<String> {
+    pub fn find(&self, key: &str) -> Vec<String> {
         let Ok(key_index) = self
             .keys
             .binary_search_by(|entry| entry.as_uncompressed().as_ref().cmp(key))
@@ -130,8 +139,6 @@ impl MemorySegment {
         else {
             return Vec::new();
         };
-
-        eprintln!("lol");
 
         let mut items = Vec::new();
 
@@ -200,7 +207,7 @@ mod tests {
         assert_eq!(unique_values.len(), 2);
 
         // resolve should return a valid value for "key"
-        let resolved = seg.resolve("key");
+        let resolved = seg.find("key");
         assert_eq!(resolved, ["value", "value2"]);
     }
 
@@ -212,8 +219,8 @@ mod tests {
         assert_eq!(seg.values.len(), 2);
         assert_eq!(seg.entries.len(), 2);
 
-        assert_eq!(seg.resolve("a"), ["1"]);
-        assert_eq!(seg.resolve("b"), ["2"]);
+        assert_eq!(seg.find("a"), ["1"]);
+        assert_eq!(seg.find("b"), ["2"]);
     }
 
     #[test]
@@ -227,7 +234,7 @@ mod tests {
         assert_eq!(seg.entries.len(), 2);
 
         // Resolve returns one of the matching values (depending on insertion order)
-        let resolved = seg.resolve("a");
+        let resolved = seg.find("a");
         assert_eq!(resolved, ["1", "2"]);
     }
 
@@ -240,8 +247,8 @@ mod tests {
         assert_eq!(seg.values.len(), 1);
         assert_eq!(seg.entries.len(), 2);
 
-        assert_eq!(seg.resolve("a"), ["1"]);
-        assert_eq!(seg.resolve("b"), ["1"]);
+        assert_eq!(seg.find("a"), ["1"]);
+        assert_eq!(seg.find("b"), ["1"]);
     }
 
     #[test]
@@ -253,6 +260,6 @@ mod tests {
         assert_eq!(seg.values.len(), 1);
         assert_eq!(seg.entries.len(), 1);
 
-        assert_eq!(seg.resolve("a"), ["1"]);
+        assert_eq!(seg.find("a"), ["1"]);
     }
 }
