@@ -1,7 +1,6 @@
-use std::{cmp::max, collections::VecDeque, path::PathBuf};
-
+use std::{collections::VecDeque, path::PathBuf};
 use fxhash::FxHashMap;
-use snafu::{IntoError, Snafu};
+use snafu::Snafu;
 use tokio::{
     fs::{self, read_dir},
     io,
@@ -53,8 +52,7 @@ impl TieredSegmentMap {
 
             let path_index = name
                 .split('-')
-                .skip(1)
-                .next()
+                .nth(1)
                 .expect("no index found in the segment name")
                 .parse::<usize>()
                 .map_err(|_| SegmentMapError::InvalidIndex)?;
@@ -129,6 +127,8 @@ impl TieredSegmentMap {
                     break;
                 };
 
+                tracing::trace!(segment = ?(segment as *const CachedSegment).addr(), "trying memory segment");
+
                 let new = segment.find(key);
 
                 if let Some(value) = limit {
@@ -146,6 +146,8 @@ impl TieredSegmentMap {
                 break;
             };
 
+            tracing::trace!(segment = ?segment.directory, "trying disk segment");
+
             let new = segment.find(key).await?;
 
             if let Some(value) = limit {
@@ -155,10 +157,10 @@ impl TieredSegmentMap {
             entries.extend(new);
         }
 
-        if let Some(at_most) = at_most {
-            if entries.len() > at_most {
-                entries.drain(at_most..);
-            }
+        if let Some(at_most) = at_most
+            && entries.len() > at_most
+        {
+            entries.drain(at_most..);
         }
 
         Ok(entries)

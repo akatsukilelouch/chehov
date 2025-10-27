@@ -1,19 +1,21 @@
 use bloomfilter::Bloom;
-use futures_lite::stream::StopAfterFuture;
 use fxhash::{FxHashMap, FxHashSet};
-use serde::{Deserialize, Serialize};
-use snafu::Snafu;
-use std::{borrow::Cow, collections::BTreeMap, path::PathBuf, sync::WaitTimeoutResult};
-use zerocopy::{ByteHash, IntoBytes};
-
-pub struct SegmentView {
-    pub directory: PathBuf,
-}
+use std::borrow::Cow;
+use zerocopy::IntoBytes;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum Entry {
     Compressed(Vec<u8>),
     Uncompressed(String),
+}
+
+impl AsRef<[u8]> for Entry {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Compressed(buffer) => buffer.as_ref(),
+            Self::Uncompressed(string) => string.as_bytes(),
+        }
+    }
 }
 
 impl Entry {
@@ -61,22 +63,25 @@ impl CachedSegment {
     ) -> (Vec<Entry>, Vec<Entry>) {
         let mut values_mapping = FxHashSet::default();
 
-        let mut linear_keys = Vec::new();
+        let mut keys = Vec::new();
 
         for (key, items) in entries {
-            linear_keys.push(Entry::new(key.as_ref()));
+            keys.push(Entry::new(key.as_ref()));
 
             values_mapping.extend(items.iter().map(|item| item.as_ref()));
         }
 
-        let mut keys = linear_keys.into_iter().collect::<Vec<_>>();
         keys.sort_unstable_by(|a, b| a.as_uncompressed().cmp(&b.as_uncompressed()));
+
+        tracing::trace!("created keys mapping: {:?}", keys.len());
 
         let mut values = values_mapping
             .into_iter()
-            .map(|item| Entry::new(item))
+            .map(Entry::new)
             .collect::<Vec<_>>();
         values.sort_unstable_by(|a, b| a.as_uncompressed().cmp(&b.as_uncompressed()));
+
+        tracing::trace!("created values mapping: {:?}", values.len());
 
         (keys, values)
     }
@@ -86,6 +91,8 @@ impl CachedSegment {
 
         let mut bloom =
             Bloom::new((entries.len().ilog2() * 2 + 1) as usize, entries.len()).unwrap();
+
+        tracing::trace!("created new bloom of size: {:?}", bloom.len());
 
         let mut entries_linear = entries
             .into_iter()
@@ -114,13 +121,17 @@ impl CachedSegment {
 
         entries_linear.sort_unstable_by_key(|&(key, ..)| key);
 
+        tracing::trace!("created entries: {:?}", entries_linear.len());
+
         entries_linear.dedup();
+
+        tracing::trace!("deduplicated entries: {:?}", entries_linear.len());
 
         Self {
             keys: keys_linear,
             values: values_linear,
             entries: entries_linear,
-            bloom: bloom,
+            bloom,
         }
     }
 
@@ -132,6 +143,8 @@ impl CachedSegment {
             return Vec::new();
         };
 
+        tracing::trace!("found key index: {:?}", key_index);
+
         let Ok(mut index) = self
             .entries
             .binary_search_by(|&(index, ..)| index.cmp(&(key_index as u32)))
@@ -139,11 +152,15 @@ impl CachedSegment {
             return Vec::new();
         };
 
+        tracing::trace!("poked (found approximately) entries at index: {:?}", index);
+
         let mut items = Vec::new();
 
-        while index as isize - 1 >= 0 && self.entries[index - 1].0 == key_index as u32 {
+        while index as isize > 0 && self.entries[index - 1].0 == key_index as u32 {
             index -= 1;
         }
+
+        tracing::trace!("found the start at index: {:?}", index);
 
         for index in index..self.entries.len() {
             let (item_key_index, value_index) = self.entries[index];
@@ -158,6 +175,8 @@ impl CachedSegment {
                     .to_string(),
             );
         }
+
+        tracing::trace!("loaded values: {:?}", items.len());
 
         items
     }

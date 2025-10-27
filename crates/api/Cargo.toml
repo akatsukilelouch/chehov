@@ -1,0 +1,15 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.6"
+clap = { version = "4.5.50", features = ["derive", "env"] }
+index = { version = "0", path = "../index" }
+serde = { version = "1.0.228", features = ["derive"] }
+snafu = { version = "0.8.9", features = ["backtrace"] }
+tokio = { version = "1.48.0", features = ["macros", "rt"] }
+tracing = "0.1.41"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }

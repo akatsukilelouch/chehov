@@ -1,11 +1,8 @@
 use fxhash::FxHashMap;
 use snafu::Snafu;
-use std::{
-    collections::BTreeMap,
-    path::PathBuf,
-    sync::{Arc, WaitTimeoutResult},
-};
+use std::path::PathBuf;
 use tokio::io;
+use tracing::Instrument;
 
 use crate::segment::{self, TieredSegmentMap};
 
@@ -48,31 +45,46 @@ impl PartitionMap {
 
             segment
                 .insert(entries)
+                .instrument(tracing::trace_span!(
+                    "tiered::index",
+                    partition = partition.as_ref(),
+                ))
                 .await?;
         }
 
         Ok(())
     }
 
-    pub async fn search<'partition, 'buffer>(
+    pub async fn search<K: AsRef<str> + Ord, B: AsRef<str>>(
         &self,
-        keys: impl IntoIterator<Item = (&'partition str, &'buffer str)>,
+        query: FxHashMap<K, Vec<B>>,
         mut limit: Option<usize>,
     ) -> Result<Vec<String>, PartitionError> {
         let mut result = Vec::new();
 
-        for (partition, key) in keys {
-            let segments = self.load_segment_map(partition).await?;
+        for (partition, keys) in query {
+            let segments = self.load_segment_map(partition.as_ref()).await?;
 
-            result.extend(segments.find(key, limit).await?);
+            for key in keys {
+                result.extend(
+                    segments
+                        .find(key.as_ref(), limit)
+                        .instrument(tracing::trace_span!(
+                            "tiered::find",
+                            partition = partition.as_ref(),
+                            key = key.as_ref(),
+                        ))
+                        .await?,
+                );
 
-            if let Some(value) = limit {
-                let left = value.saturating_sub(result.len());
+                if let Some(value) = limit {
+                    let left = value.saturating_sub(result.len());
 
-                if left > 0 {
-                    limit = Some(left);
-                } else {
-                    break;
+                    if left > 0 {
+                        limit = Some(left);
+                    } else {
+                        break;
+                    }
                 }
             }
         }

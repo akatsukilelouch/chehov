@@ -1,23 +1,22 @@
 use std::{
     backtrace::Backtrace,
     cmp::Ordering,
-    io::{ErrorKind, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-    process::Command,
+    io::{ErrorKind, SeekFrom},
+    path::PathBuf,
 };
-
 use bitflags::bitflags;
 use bloomfilter::Bloom;
 use snafu::Snafu;
 use tokio::{
     fs::{self, File},
-    io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, BufWriter},
+    io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter},
 };
+use tracing::Instrument;
 
-use super::memory::{Entry, CachedSegment};
+use super::memory::{CachedSegment, Entry};
 
 pub struct DiskSegment {
-    directory: PathBuf,
+    pub directory: PathBuf,
 }
 
 impl DiskSegment {
@@ -67,7 +66,7 @@ impl DiskSegment {
                 Entry::Compressed(buffer) => {
                     bitflags! {
                         struct EntryFlag: u32 {
-                            const COMPRESSED = 0b1 << size_of::<u32>() * 8 - 1;
+                            const COMPRESSED = 0b1 << (u32::BITS - 1);
                         }
                     }
 
@@ -100,7 +99,7 @@ impl DiskSegment {
             .open(self.directory.join("bloom.bin"))
             .await?;
 
-        file.write_all(&filter.as_slice()).await
+        file.write_all(filter.as_slice()).await
     }
 
     async fn write_entries(
@@ -177,6 +176,7 @@ struct LinearMappedResolver {
     pub lookup: File,
     pub length: u64,
 }
+
 async fn read_offset(lookup: &mut File, offset: u64) -> Result<u64, DiskResolutionError> {
     lookup.seek(SeekFrom::Start(offset)).await?;
 
@@ -199,12 +199,17 @@ async fn read_entry_within(data: &mut File, offset: u64) -> Result<String, DiskR
         Entry::Uncompressed(String::try_from(buffer).map_err(|err| err.utf8_error())?)
     };
 
+    tracing::trace!(
+        "loaded entry (compressed: {compressed:?}) of raw size: {:?}",
+        buffer.as_ref().len()
+    );
+
     Ok(buffer.into_uncompressed())
 }
 
 impl LinearMappedResolver {
     pub async fn map_to_index(&mut self, key: &str) -> Result<Option<u32>, DiskResolutionError> {
-        if self.length % size_of::<u64>() as u64 != 0 {
+        if !self.length.is_multiple_of(size_of::<u64>() as u64) {
             return Err(DiskResolutionError::LookupInvalidSize);
         }
 
@@ -228,6 +233,8 @@ impl LinearMappedResolver {
                     current += value
                 }
                 Ordering::Equal => {
+                    tracing::trace!("found item at {current:?}");
+
                     return Ok(Some(current));
                 }
             }
@@ -237,7 +244,7 @@ impl LinearMappedResolver {
     }
 
     pub async fn get_value_under(&mut self, index: u32) -> Result<String, DiskResolutionError> {
-        if self.length % size_of::<u64>() as u64 != 0 {
+        if !self.length.is_multiple_of(size_of::<u64>() as u64) {
             return Err(DiskResolutionError::LookupInvalidSize);
         }
 
@@ -263,6 +270,7 @@ impl EntriesAndLinearMappedValueResolver {
             let index = match self.entries.read_u32().await {
                 Err(err) => {
                     if err.kind() == ErrorKind::UnexpectedEof {
+                        tracing::trace!("file has ended");
                         break;
                     } else {
                         return Err(err.into());
@@ -272,6 +280,7 @@ impl EntriesAndLinearMappedValueResolver {
             };
 
             if index != key {
+                tracing::trace!("slice has ended");
                 break;
             }
 
@@ -287,22 +296,21 @@ impl EntriesAndLinearMappedValueResolver {
         mut self,
         key: u32,
     ) -> Result<Vec<String>, DiskResolutionError> {
-        if self.length % (size_of::<u32>() * 2) as u64 != 0 {
+        if !self.length.is_multiple_of(size_of::<[u32; 2]>() as u64) {
             return Err(DiskResolutionError::LookupInvalidSize);
         }
 
-        let size = length(self.length, size_of::<u32>() * 2);
+        let size = length(self.length, size_of::<[u32; 2]>());
 
         self.entries
-            .seek(SeekFrom::Start(convert(size, size_of::<u32>() * 2)))
+            .seek(SeekFrom::Start(convert(size, size_of::<[u32; 2]>())))
             .await?;
 
         let mut offset = size / 2;
 
         for step in 2..self.length.ilog2() + 1 {
-            let pos = self
-                .entries
-                .seek(SeekFrom::Start(convert(offset, size_of::<u32>() * 2)))
+            self.entries
+                .seek(SeekFrom::Start(convert(offset, size_of::<[u32; 2]>())))
                 .await?;
 
             let index = self.entries.read_u32().await?;
@@ -336,7 +344,7 @@ impl EntriesAndLinearMappedValueResolver {
                 .seek(SeekFrom::Start(convert(offset, size_of::<[u32; 2]>())))
                 .await?;
 
-            return Ok(self.read_sequential(key).await?);
+            return self.read_sequential(key).await;
         }
 
         Ok(vec![])
@@ -349,11 +357,15 @@ impl DiskSegment {
             let mut bloom = File::open(self.directory.join("bloom.bin")).await?;
             let mut buffer = Vec::with_capacity(4096);
             bloom.read_to_end(&mut buffer).await?;
-            let bloom =
-                Bloom::<str>::from_bytes(buffer).map_err(|_| DiskResolutionError::BloomLoadError)?;
+            let bloom = Bloom::<str>::from_bytes(buffer)
+                .map_err(|_| DiskResolutionError::BloomLoadError)?;
+
+            tracing::trace!("loaded bloom of size: {:?}", bloom.len());
 
             bloom.check(key)
         };
+
+        tracing::trace!("bloom existence: {contains:?}");
 
         if !contains {
             return Ok(vec![]);
@@ -368,8 +380,11 @@ impl DiskSegment {
                 lookup: keys_lookup_file,
             }
             .map_to_index(key)
+            .instrument(tracing::trace_span!("disk::map_to_index",))
             .await?
         };
+
+        tracing::trace!("resolved key index: {resolved_key:?}");
 
         let Some(key_index) = resolved_key else {
             return Ok(vec![]);
@@ -390,8 +405,14 @@ impl DiskSegment {
                 entries: entries_file,
             }
             .resolve_entries_with_key(key_index)
+            .instrument(tracing::trace_span!(
+                "disk::resolve_entries",
+                index = key_index,
+            ))
             .await?
         };
+
+        tracing::trace!("resolved values: {:?}", values.len());
 
         Ok(values)
     }
@@ -401,11 +422,10 @@ impl DiskSegment {
 mod tests {
     use super::*;
     use crate::segment::memory::CachedSegment;
-    use std::collections::HashSet;
     use fxhash::FxHashMap;
+    use std::collections::HashSet;
     use tempfile::tempdir;
     use tokio::fs;
-
 
     #[tokio::test]
     async fn flush_and_find_single_key_multiple_values() {
